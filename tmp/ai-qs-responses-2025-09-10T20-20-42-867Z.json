@@ -1,0 +1,109 @@
+{
+  "tag": "responses",
+  "model": "gpt-5-mini",
+  "count": 6,
+  "qs": [
+    {
+      "k": "mcq",
+      "t": "Co popisuje technika Dropout v neuronových sítích?",
+      "o": [
+        "Náhodné odstranění vrstev během tréninku.",
+        "Nastavení výstupu neuronů s určitou pravděpodobností na hodnotu 0.",
+        "Zvětšení počtu filtrů v konvolučních vrstvách.",
+        "Použití předdefinovaných tvarů boxů pro detekci objektů."
+      ],
+      "ci": [
+        1
+      ],
+      "s": {
+        "c": "68b417b0692c1d903babcbe7",
+        "f": "68b41773692c1d903babcbd8"
+      }
+    },
+    {
+      "k": "mcq",
+      "t": "Který rok je spojen se vznikem architektury AlexNet podle textu?",
+      "o": [
+        "2010",
+        "2012",
+        "2014",
+        "2018"
+      ],
+      "ci": [
+        1
+      ],
+      "s": {
+        "c": "68b417b0692c1d903babcbe7",
+        "f": "68b41773692c1d903babcbd8"
+      }
+    },
+    {
+      "k": "mcq",
+      "t": "Jaký je hlavní cíl inception modulu v konvolučních sítích?",
+      "o": [
+        "Použít pouze jednu velikost filtru v každém bloku.",
+        "Aproximovat optimální lokální strukturu CNN použitím více velikostí filtrů v jednom bloku.",
+        "Zavést plně propojené vrstvy pro snížení parametrů.",
+        "Nahrazovat pooling vrstvy pro zrychlení tréninku."
+      ],
+      "ci": [
+        1
+      ],
+      "s": {
+        "c": "68b417b0692c1d903babcbe8",
+        "f": "68b41773692c1d903babcbd8"
+      }
+    },
+    {
+      "k": "mcq",
+      "t": "Co znamená pojem sliding window (pohyblivé okno) v kontextu detekce objektů?",
+      "o": [
+        "Rozdělení obrazu na pevné mřížky pro každý objekt.",
+        "Použití klasifikátoru na posuvné okno pro hledání objektů v obraze.",
+        "Použití předdefinovaných anchor boxů místo bounding boxů.",
+        "Vytvoření více úrovní feature map pro detekci malých objektů."
+      ],
+      "ci": [
+        1
+      ],
+      "s": {
+        "c": "68b417b0692c1d903babcbe8",
+        "f": "68b41773692c1d903babcbd8"
+      }
+    },
+    {
+      "k": "mcq",
+      "t": "Jaká mřížka je uvedena jako příklad rozdělení obrazu v jednom z detekčních přístupů (originál)?",
+      "o": [
+        "5 × 5",
+        "7 × 7",
+        "10 × 10",
+        "3 × 3"
+      ],
+      "ci": [
+        1
+      ],
+      "s": {
+        "c": "68b417b0692c1d903babcbea",
+        "f": "68b41773692c1d903babcbd8"
+      }
+    },
+    {
+      "k": "mcq",
+      "t": "Co je Anchor Box podle textu?",
+      "o": [
+        "Výsledný obdélník kolem detekovaného objektu po predikci modelu.",
+        "Předdefinované tvary boxů, které model používá jako startovní šablony pro predikci bounding boxů.",
+        "Speciální druh pooling vrstvy pro zlepšení přesnosti.",
+        "Typ augmentace dat používaný při tréninku."
+      ],
+      "ci": [
+        1
+      ],
+      "s": {
+        "c": "68b417b0692c1d903babcbea",
+        "f": "68b41773692c1d903babcbd8"
+      }
+    }
+  ]
+}

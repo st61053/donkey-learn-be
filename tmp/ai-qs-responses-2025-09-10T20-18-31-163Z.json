@@ -1,0 +1,109 @@
+{
+  "tag": "responses",
+  "model": "gpt-5-mini",
+  "count": 6,
+  "qs": [
+    {
+      "k": "mcq",
+      "t": "Jaký typ spojení má Hopfieldova síť mezi neurony?",
+      "o": [
+        "Úplná vážená spojení mezi všemi neurony kromě sebe sama",
+        "Žádná spojení, neurony fungují nezávisle",
+        "Pouze spojení do vrstev vpřed (feedforward)",
+        "Spojení pouze mezi sousedními neurony v řetězci"
+      ],
+      "ci": [
+        0
+      ],
+      "s": {
+        "c": "68b417e7692c1d903babcc23",
+        "f": "68b41752692c1d903babcbcf"
+      }
+    },
+    {
+      "k": "mcq",
+      "t": "Co platí o vstupních a výstupních hodnotách v diskrétní Hopfieldově síti?",
+      "o": [
+        "Hodnoty jsou bipolární",
+        "Hodnoty jsou reálné v rozsahu 0–1",
+        "Hodnoty jsou celá čísla bez znaménka",
+        "Hodnoty jsou komplexní čísla"
+      ],
+      "ci": [
+        0
+      ],
+      "s": {
+        "c": "68b417e7692c1d903babcc23",
+        "f": "68b41752692c1d903babcbcf"
+      }
+    },
+    {
+      "k": "mcq",
+      "t": "Jaký princip se používá při vybavování vzoru v Hopfieldově síti podle zadaného textu?",
+      "o": [
+        "Za odpověď se bere vzor v paměti s nejkratší Hammingovou vzdáleností",
+        "Za odpověď se bere náhodný uložený vzor",
+        "Za odpověď se bere vzor se stejným součtem bitů jako vstup",
+        "Za odpověď se bere vzor s největším počtem nul"
+      ],
+      "ci": [
+        0
+      ],
+      "s": {
+        "c": "68b417e7692c1d903babcc25",
+        "f": "68b41752692c1d903babcbcf"
+      }
+    },
+    {
+      "k": "mcq",
+      "t": "Jaká vlastnost platí pro matici vah w u Hopfieldovy sítě podle textu?",
+      "o": [
+        "Matice vah je symetrická n x n",
+        "Matice vah je diagonální",
+        "Matice vah je asymetrická a nesouměrná",
+        "Matice vah obsahuje pouze nulové prvky"
+      ],
+      "ci": [
+        0
+      ],
+      "s": {
+        "c": "68b417e7692c1d903babcc25",
+        "f": "68b41752692c1d903babcbcf"
+      }
+    },
+    {
+      "k": "mcq",
+      "t": "Které pravidlo učení se aplikuje při trénování Hopfieldovy sítě podle textu?",
+      "o": [
+        "Hebbův zákon učení",
+        "Zpětná propagace (backpropagation)",
+        "Algoritmus k‑nejbližších sousedů",
+        "Genetický algoritmus"
+      ],
+      "ci": [
+        0
+      ],
+      "s": {
+        "c": "68b417e7692c1d903babcc25",
+        "f": "68b41752692c1d903babcbcf"
+      }
+    },
+    {
+      "k": "mcq",
+      "t": "Jaký je tvar Hebbova pravidla aktualizace váhy pro perceptron uvedený v textu?",
+      "o": [
+        "w_i = w_i + x_i ⋅ t",
+        "w_i = w_i - η⋅∂E/∂w_i",
+        "w_i = náhodná hodnota",
+        "w_i = součin všech vstupů"
+      ],
+      "ci": [
+        0
+      ],
+      "s": {
+        "c": "68b417e7692c1d903babcc2d",
+        "f": "68b41752692c1d903babcbcf"
+      }
+    }
+  ]
+}

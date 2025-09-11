@@ -1,74 +1,90 @@
-// src/tests/schemas/test.schema.ts
-import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
-import { HydratedDocument, Types, Schema as MongooseSchema } from 'mongoose';
-import { QuestionEntity, QuestionSchema } from './question.schema';
+// ./schemas/test.schema.ts
+import { Prop, Schema as NestSchema, SchemaFactory } from '@nestjs/mongoose';
+import { HydratedDocument, Schema as MongooseSchema } from 'mongoose';
 
-// ===== Typy dokumentů =====
-export type TestDocument = HydratedDocument<TestEntity>;
-export type AttemptDocument = HydratedDocument<AttemptEntity>;
+/** DB-friendly tvar otázky (TS typ jen pro pohodlí vývoje). */
+export type DbQuestion =
+    | { type: 'mcq' | 'msq'; text: string; choices: string[]; correct: number[]; meta?: { chunkId?: string; fileId?: string } }
+    | { type: 'tf'; text: string; truth: boolean; meta?: { chunkId?: string; fileId?: string } }
+    | { type: 'short'; text: string; answer: string; meta?: { chunkId?: string; fileId?: string } }
+    | { type: 'cloze'; text: string; gaps: string[]; meta?: { chunkId?: string; fileId?: string } }
+    | { type: 'match'; text: string; left: string[]; right: string[]; meta?: { chunkId?: string; fileId?: string } }
+    | { type: 'order'; text: string; items: string[]; meta?: { chunkId?: string; fileId?: string } };
 
-// (Volitelné) starý MCQ-only model můžeš klidně odstranit; pokud ho necháš, nenechává se zapsat do DB samostatně.
-@Schema({ _id: false })
-export class McqQuestion {
-    @Prop({ required: true }) text!: string;
-    @Prop({ type: [String], required: true }) options!: string[]; // A–D
-    @Prop({ required: true, enum: ['A', 'B', 'C', 'D'] }) answerKey!: 'A' | 'B' | 'C' | 'D';
-}
-export const McqQuestionSchema = SchemaFactory.createForClass(McqQuestion);
+/** Sub-schema pro otázku (Mongoose). */
+export const QuestionSchema = new MongooseSchema(
+    {
+        type: { type: String, enum: ['mcq', 'msq', 'tf', 'short', 'cloze', 'match', 'order'], required: true },
+        text: { type: String, required: true },
 
-// ===== Test =====
-@Schema({ collection: 'tests', timestamps: true })
-export class TestEntity {
-    @Prop({ required: true }) ownerId!: string;
+        // variantní pole dle typu
+        choices: { type: [String], default: undefined }, // mcq/msq
+        correct: { type: [Number], default: undefined }, // mcq/msq
+        truth: { type: Boolean, default: undefined },    // tf
+        answer: { type: String, default: undefined },    // short
+        left: { type: [String], default: undefined },  // match
+        right: { type: [String], default: undefined },  // match
+        gaps: { type: [String], default: undefined },  // cloze
+        items: { type: [String], default: undefined },  // order
 
-    @Prop({ type: Types.ObjectId, required: true, index: true })
-    folderId!: Types.ObjectId;
+        meta: {
+            chunkId: { type: String },
+            fileId: { type: String },
+        },
+    },
+    { _id: false }
+);
 
-    @Prop({ type: Types.ObjectId, index: true })
-    fileId?: Types.ObjectId; // jen u topic testů
+/** Lehká validace podle typu (zachytí zjevné chyby). */
+QuestionSchema.path('type').validate(function () {
+    const q = this as any;
+    switch (q.type) {
+        case 'mcq':
+        case 'msq':
+            if (!Array.isArray(q.choices) || q.choices.length < 2) return false;
+            if (!Array.isArray(q.correct) || q.correct.length < 1) return false;
+            return q.correct.every((i: any) => Number.isInteger(i) && i >= 0 && i < q.choices.length);
+        case 'tf':
+            return typeof q.truth === 'boolean';
+        case 'short':
+            return typeof q.answer === 'string' && q.answer.trim().length > 0;
+        case 'cloze':
+            return Array.isArray(q.gaps) && q.gaps.length > 0;
+        case 'match':
+            return Array.isArray(q.left) && q.left.length >= 2 && Array.isArray(q.right) && q.right.length >= 2;
+        case 'order':
+            return Array.isArray(q.items) && q.items.length >= 2;
+        default:
+            return false;
+    }
+}, 'Invalid question payload for given type.');
 
-    @Prop({ required: true, enum: ['topic', 'final'] })
-    type!: 'topic' | 'final';
+@NestSchema({ timestamps: true, minimize: true })
+export class Test {
+    @Prop({ required: true }) folderId: string;
+    @Prop({ required: true }) uploaderId: string;
 
-    @Prop({ required: true }) title!: string;
-
-    @Prop({ default: false }) archived!: boolean;
-
-    @Prop({ default: 'fake-v1' })
-    strategy!: string; // např. 'ai-v1' / 'fake-v1'
-
-    // Hlavní pole otázek – používáš unifikované QuestionEntity (mcq/msq/tf/cloze/short/match/order)
     @Prop({ type: [QuestionSchema], default: [] })
-    questions!: QuestionEntity[];
+    questions: DbQuestion[];
+
+    @Prop({ default: false }) archived: boolean;
+    @Prop() model?: string;
+
+    // Volitelné:
+    // @Prop() type?: 'topic' | 'final';
+    // @Prop() sourceFileId?: string;
 }
-export const TestSchema = SchemaFactory.createForClass(TestEntity);
-TestSchema.index({ ownerId: 1, folderId: 1, type: 1, createdAt: -1 });
 
-// ===== Attempt =====
-// Pokud používáš AI s různými typy otázek, odpovědi ulož polymorfně:
-@Schema({ collection: 'attempts', timestamps: true })
-export class AttemptEntity {
-    @Prop({ required: true, index: true }) ownerId!: string;
+export type TestDocument = HydratedDocument<Test>;
+export const TestSchema = SchemaFactory.createForClass(Test);
 
-    @Prop({ type: Types.ObjectId, required: true, index: true })
-    testId!: Types.ObjectId;
+/** Index pro listování ve složce. */
+TestSchema.index({ folderId: 1, uploaderId: 1, archived: 1, createdAt: -1 });
 
-    @Prop({ enum: ['in_progress', 'submitted'], default: 'in_progress', index: true })
-    status!: 'in_progress' | 'submitted';
-
-    // Polymorfní odpovědi (mcq/msq/tf/cloze/short/match/order); ladí s UpdateAnswersDto i TestsService
-    @Prop({ type: [MongooseSchema.Types.Mixed], default: [] })
-    answers!: any[];
-
-    @Prop() score?: number;
-    @Prop() total?: number;
-    @Prop() submittedAt?: Date;
-}
-export const AttemptSchema = SchemaFactory.createForClass(AttemptEntity);
-AttemptSchema.index({ ownerId: 1, testId: 1, createdAt: -1 });
-
-/* 
-// ALTERNATIVA pro čistě MCQ-only scénář (NEPOUŽÍVEJ, pokud máš AI typy):
-@Prop({ type: [String], default: [] })
-answers!: Array<'A' | 'B' | 'C' | 'D' | null>;
-*/
+/** Čistší JSON výstup (oprava TS chyby přes Reflect.deleteProperty). */
+TestSchema.set('toJSON', {
+    transform(_doc: any, ret: any) {
+        Reflect.deleteProperty(ret, '__v');
+        return ret;
+    },
+});

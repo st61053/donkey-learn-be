@@ -1,0 +1,109 @@
+{
+  "tag": "responses",
+  "model": "gpt-5-mini",
+  "count": 6,
+  "qs": [
+    {
+      "k": "mcq",
+      "t": "Jaký je Hebbův update váhy pro bipolární vstupy a aktivační funkci podle úryvku?",
+      "o": [
+        "w_i = w_i + x_i ⋅ t",
+        "w_i = w_i + α ⋅ x_i ⋅ e",
+        "w_i = w_i + α ⋅ e",
+        "w_i = w_0 + α ⋅ e"
+      ],
+      "ci": [
+        0
+      ],
+      "s": {
+        "c": "68b417fd692c1d903babcc3a",
+        "f": "68b41744692c1d903babcbcc"
+      }
+    },
+    {
+      "k": "mcq",
+      "t": "Který vztah popisuje výpočet potenciálu neuronu y_a uvedený v úryvku?",
+      "o": [
+        "y_a = Σ_{i=0}^R w_i ⋅ x_i",
+        "y_a = φ(y_a)",
+        "y = φ(y_a)",
+        "w^T x = φ(y)"
+      ],
+      "ci": [
+        0
+      ],
+      "s": {
+        "c": "68b417fd692c1d903babcc37",
+        "f": "68b41744692c1d903babcbcc"
+      }
+    },
+    {
+      "k": "mcq",
+      "t": "Jak je definována odezva neuronu y podle úryvku?",
+      "o": [
+        "y = φ(y_a)",
+        "y_a = φ(y)",
+        "y = Σ w_i x_i",
+        "y = w^T φ(x)"
+      ],
+      "ci": [
+        0
+      ],
+      "s": {
+        "c": "68b417fd692c1d903babcc37",
+        "f": "68b41744692c1d903babcbcc"
+      }
+    },
+    {
+      "k": "mcq",
+      "t": "Který krok NEpatří do popsaného algoritmu chybového učení perceptronu?",
+      "o": [
+        "Adaptuj váhy podle w_i = w_i + α ⋅ x_i ⋅ e",
+        "Náhodně nastav váhy neuronu w a zvol koeficient rychlosti učení α",
+        "Prováděj aktualizace pouze v poslední epoše (offline) bez výpočtu chyby každého vzoru",
+        "Spočítej chybu e = (t − y)"
+      ],
+      "ci": [
+        2
+      ],
+      "s": {
+        "c": "68b417fd692c1d903babcc3a",
+        "f": "68b41744692c1d903babcbcc"
+      }
+    },
+    {
+      "k": "mcq",
+      "t": "Jaká je charakteristika online varianty učení ANN podle úryvku?",
+      "o": [
+        "Po každém vzoru dojde k aktualizaci hodnot vah a prahů",
+        "Změny vah a prahů se aktualizují až na konci epochy",
+        "Aktualizace se provádí po dávkách vzorků (např. 32, 64)",
+        "Kombinuje výhody bez nevýhod obou přístupů"
+      ],
+      "ci": [
+        0
+      ],
+      "s": {
+        "c": "68b417fd692c1d903babcc3f",
+        "f": "68b41744692c1d903babcbcc"
+      }
+    },
+    {
+      "k": "mcq",
+      "t": "Jaký výraz je uveden pro chybu na výstupu v algoritmu chybového učení perceptronu?",
+      "o": [
+        "e = (t − y)",
+        "E = 1/N Σ e_i",
+        "e = Σ_{k=1}^Q (t_k − y_k)^2",
+        "e = w^T x"
+      ],
+      "ci": [
+        0
+      ],
+      "s": {
+        "c": "68b417fd692c1d903babcc3a",
+        "f": "68b41744692c1d903babcbcc"
+      }
+    }
+  ]
+}

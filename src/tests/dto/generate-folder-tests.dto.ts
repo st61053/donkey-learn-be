@@ -1,32 +1,76 @@
-import { IsBoolean, IsInt, IsOptional, IsIn, Max, Min, IsObject } from 'class-validator';
-import { ApiPropertyOptional } from '@nestjs/swagger';
+import { ApiProperty } from '@nestjs/swagger';
+import {
+    IsBoolean,
+    IsNumber,
+    IsObject,
+    IsOptional,
+    IsString,
+    Min,
+} from 'class-validator';
 
 export class GenerateFolderTestsDto {
-    @ApiPropertyOptional({ minimum: 1, maximum: 50, default: 5, example: 4 })
-    @IsOptional() @IsInt() @Min(1) @Max(50)
-    topicCount?: number = 5;
-
-    @ApiPropertyOptional({ minimum: 1, maximum: 200, default: 20, example: 6 })
-    @IsOptional() @IsInt() @Min(1) @Max(200)
-    finalCount?: number = 20;
-
-    @ApiPropertyOptional({ default: true, example: true })
-    @IsOptional() @IsBoolean()
-    archiveExisting?: boolean = true;
-
-    @ApiPropertyOptional({ enum: ['fake', 'ai'], default: 'fake', example: 'ai' })
-    @IsOptional() @IsIn(['fake', 'ai'])
-    strategy?: 'fake' | 'ai' = 'fake';
-
-    // Swagger neumí přímo odvodit Partial<Record<...>>, proto schema ručně:
-    @ApiPropertyOptional({
-        type: 'object',
-        additionalProperties: { type: 'number' },
-        example: { mcq: 5, tf: 2, msq: 2, cloze: 1 },
-        description:
-            'Rozdělení typů úloh. Povolené klíče: mcq, msq, tf, cloze, short, match, order.',
+    @ApiProperty({
+        description: 'Počet otázek na téma (výchozí 5)',
+        example: 4,
+        required: false,
     })
-    @IsOptional() @IsObject()
-    mix?: Partial<Record<'mcq' | 'msq' | 'tf' | 'cloze' | 'short' | 'match' | 'order', number>>;
-}
+    @IsOptional()
+    @IsNumber()
+    @Min(1)
+    topicCount?: number;
 
+    @ApiProperty({
+        description: 'Celkový počet otázek ve finálním testu (výchozí 20)',
+        example: 6,
+        required: false,
+    })
+    @IsOptional()
+    @IsNumber()
+    @Min(1)
+    finalCount?: number;
+
+    @ApiProperty({
+        description: 'Archivovat existující testy před generováním?',
+        example: true,
+        required: false,
+    })
+    @IsOptional()
+    @IsBoolean()
+    archiveExisting?: boolean;
+
+    @ApiProperty({
+        description: 'Strategie generování (ai | fake)',
+        example: 'ai',
+        required: false,
+    })
+    @IsOptional()
+    @IsString()
+    strategy?: string;
+
+    @ApiProperty({
+        description: 'Mix typů otázek',
+        example: { mcq: 5, tf: 2, msq: 2, cloze: 1 },
+        required: false,
+    })
+    @IsOptional()
+    @IsObject()
+    mix?: Record<string, number>;
+
+    @ApiProperty({
+        description: 'Použitý AI model',
+        example: 'gpt-5-mini',
+        required: false,
+    })
+    @IsOptional()
+    @IsString()
+    model?: string;
+
+    @ApiProperty({
+        description: 'Socket ID pro reportování průběhu',
+        example: 'socket-123',
+        required: false,
+    })
+    @IsOptional()
+    @IsString()
+    socketId?: string;
+}

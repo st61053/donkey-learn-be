@@ -9,7 +9,7 @@ import { FilesModule } from './files/files.module';
 import { MongooseModule } from '@nestjs/mongoose';
 import { AuthModule } from './auth/auth.module';
 import { FoldersModule } from './folders/folders.module';
-import { DocumentsModule } from './documents/documents.module';
+import { AiModule } from './ai/ai.module';
 import { TestsModule } from './tests/tests.module';
 
 @Module({
@@ -24,14 +24,13 @@ import { TestsModule } from './tests/tests.module';
         uri: cfg.get<string>('MONGO_URI') ?? 'mongodb://localhost:27017/donkey-learn',
       }),
     }),
-
     MinioModule, // klient na MinIO
     // UploadModule, // upload endpoint
     AuthModule,
     FoldersModule,
     FilesModule,
-    DocumentsModule,
     TerminusModule,
+    AiModule,
     TestsModule,
     HealthModule,
   ],

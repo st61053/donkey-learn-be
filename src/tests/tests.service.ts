@@ -1,383 +1,409 @@
-// src/tests/tests.service.ts
-import {
-    BadRequestException,
-    ForbiddenException,
-    Injectable,
-    NotFoundException,
-} from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, Types } from 'mongoose';
-import { TestEntity, AttemptEntity } from './schemas/test.schema';
-import { Folder } from '../folders/schemas/folder.schema';
+import { TestDocument, Test } from './schemas/test.schema';
 import { StoredFile } from '../files/schemas/file.schema';
 import { Chunk } from '../files/schemas/chunk.schema';
+import { GenerateFolderTestsDto } from './dto/generate-folder-tests.dto';
+import { AiService } from '../ai/ai.service';
+import { TokenBudgetService } from '../ai/token-budget.service';
+import { SocketGateway } from './ws/socket.gateway';
+import { AiQuestion } from '../ai/dto/ai-response.dto';
+import { ChunkSelectorService, SelChunk } from '../ai/chunk-selector.service';
 
-import { QuestionEntity } from './schemas/question.schema';
-import { redactQuestions } from './utils/redact-questions';
-import { makeFakeQuestion } from './utils/fake-question-factory';
-import { QuestionGeneratorService } from 'src/ai/question-generator.service';
+type PreflightChunk = { id: string; text: string; fileId?: string };
 
-type UserCtx = { userId: string; roles?: string[] };
+// Lokální DB-friendly tvar otázky (nemusíš exportovat; je to jen pro typovou pohodu)
+type DbQuestion =
+    | { type: 'mcq' | 'msq'; text: string; choices: string[]; correct: number[]; meta: { chunkId?: string; fileId?: string } }
+    | { type: 'tf'; text: string; truth: boolean; meta: { chunkId?: string; fileId?: string } }
+    | { type: 'short'; text: string; answer: string; meta: { chunkId?: string; fileId?: string } }
+    | { type: 'cloze'; text: string; gaps: string[]; meta: { chunkId?: string; fileId?: string } }
+    | { type: 'match'; text: string; left: string[]; right: string[]; meta: { chunkId?: string; fileId?: string } }
+    | { type: 'order'; text: string; items: string[]; meta: { chunkId?: string; fileId?: string } };
 
 @Injectable()
 export class TestsService {
+    private readonly logger = new Logger(TestsService.name);
+
+    // Defaulty – přepiš ENV proměnnými
+    private readonly WINDOW_SIZE = Number(process.env.AI_WINDOW_SIZE ?? 8);
+    private readonly PER_WINDOW_TARGET = Number(process.env.AI_PER_WINDOW_TARGET ?? 4);
+
     constructor(
-        @InjectModel(TestEntity.name) private readonly testModel: Model<TestEntity>,
-        @InjectModel(AttemptEntity.name) private readonly attemptModel: Model<AttemptEntity>,
-        @InjectModel(Folder.name) private readonly folderModel: Model<Folder>,
+        @InjectModel(Test.name) private readonly testModel: Model<TestDocument>,
         @InjectModel(StoredFile.name) private readonly fileModel: Model<StoredFile>,
         @InjectModel(Chunk.name) private readonly chunkModel: Model<Chunk>,
-        private readonly ai: QuestionGeneratorService, // AI generátor (Structured Outputs)
+        private readonly ai: AiService,
+        private readonly tokenBudget: TokenBudgetService,
+        private readonly socketGateway: SocketGateway,
+        private readonly selector: ChunkSelectorService,
     ) { }
 
-    // ===== Helpers =====
-    private ensureOwner(ownerId: string, user: UserCtx) {
-        if (ownerId !== user.userId) throw new ForbiddenException('Not allowed');
-    }
+    /**
+     * Per-file generování:
+     *  - pro KAŽDÝ soubor poskládáme okna jen z jeho chunků a voláme AI
+     *  - zastavíme se, jakmile nasbíráme ≥ topicCount otázek pro daný soubor (nebo dojdou okna)
+     *  - pak vytvoříme finální test z celého poolu (napříč soubory) o velikosti finalCount
+     */
+    async generateForFolder(folderId: string, user: { userId: string }, dto: GenerateFolderTestsDto) {
+        const {
+            topicCount = 4,       // kolik otázek do topic testu pro každý soubor
+            finalCount = 6,       // finální test
+            archiveExisting = true,
+            strategy = 'ai',
+            mix = { mcq: 5 },     // např. jen MCQ
+            model = process.env.OPENAI_MODEL || 'gpt-4o-mini',
+            socketId,
+        } = dto;
 
-    private toObjId(id: string) {
-        return new Types.ObjectId(id);
-    }
+        this.logProgress(socketId, 0, 'Starting folder generation');
 
-    // ===== PUBLIC READ =====
-    async getPublicTest(testId: string, user: UserCtx) {
-        const t = await this.testModel.findById(testId).lean();
-        if (!t) throw new NotFoundException('Test not found');
-        const folder = await this.folderModel.findById(t.folderId).lean();
-        if (!folder) throw new NotFoundException('Folder missing');
-        this.ensureOwner(folder.ownerId, user);
-
-        return {
-            id: t._id.toString(),
-            folderId: t.folderId?.toString(),
-            fileId: t.fileId?.toString(),
-            type: t.type,
-            title: t.title,
-            archived: !!t.archived,
-            questionCount: (t.questions ?? []).length,
-            questions: redactQuestions(t.questions ?? []), // schová správné odpovědi
-            createdAt: (t as any).createdAt,
-        };
-    }
-
-    async listTestsForFolder(folderId: string, user: UserCtx, includeArchived = false) {
-        const folder = await this.folderModel.findById(folderId).lean();
-        if (!folder) throw new NotFoundException('Folder not found');
-        this.ensureOwner(folder.ownerId, user);
-
-        const q: any = { ownerId: user.userId, folderId: this.toObjId(folderId) };
-        if (!includeArchived) q.archived = false;
-
-        const rows = await this.testModel.find(q).sort({ type: 1, createdAt: -1 }).lean();
-        return rows.map((t) => ({
-            id: t._id.toString(),
-            type: t.type,
-            title: t.title,
-            fileId: t.fileId?.toString(),
-            archived: !!t.archived,
-            questionCount: (t.questions ?? []).length,
-            createdAt: (t as any).createdAt,
-        }));
-    }
-
-    async updateTest(testId: string, user: UserCtx, archived: boolean) {
-        const t = await this.testModel.findById(testId).lean();
-        if (!t) throw new NotFoundException('Test not found');
-        const folder = await this.folderModel.findById(t.folderId).lean();
-        if (!folder) throw new NotFoundException('Folder missing');
-        this.ensureOwner(folder.ownerId, user);
-
-        await this.testModel.updateOne({ _id: t._id }, { $set: { archived } });
-        return { ok: true };
-    }
-
-    // ===== GENERATION =====
-    async generateForFolder(
-        folderId: string,
-        user: UserCtx,
-        topicCount = 5,
-        finalCount = 20,
-        archiveExisting = true,
-        strategy: 'fake' | 'ai' = 'fake',
-        mix?: Partial<Record<'mcq' | 'msq' | 'tf' | 'cloze' | 'short' | 'match' | 'order', number>>,
-    ) {
-        const folder = await this.folderModel.findById(folderId).lean();
-        if (!folder) throw new NotFoundException('Folder not found');
-        this.ensureOwner(folder.ownerId, user);
-
-        const files = await this.fileModel.find({
-            folderId: this.toObjId(folderId),
-            uploaderId: user.userId,
-        }).lean();
-        if (!files.length) throw new BadRequestException('Folder has no files for this user');
-
+        // 1) archivace existujících testů (volitelně)
         if (archiveExisting) {
             await this.testModel.updateMany(
-                { ownerId: user.userId, folderId: this.toObjId(folderId), archived: false },
-                { $set: { archived: true } },
+                { folderId, uploaderId: user.userId, archived: false },
+                { archived: true },
             );
+            this.logProgress(socketId, 3, 'Archived existing tests');
         }
 
-        const createdIds: string[] = [];
+        // 2) soubory ve složce
+        const files = await this.fileModel.find({
+            folderId: new Types.ObjectId(folderId),
+            uploaderId: user.userId,
+        }).lean();
 
-        // Topic tests (1 file = 1 topic test)
-        for (const file of files) {
-            const qs = await this.buildQuestionsFromFile(file._id.toString(), topicCount, strategy, mix);
-            if (!qs.length) continue;
-
-            const t = await this.testModel.create({
-                ownerId: user.userId,
-                folderId: this.toObjId(folderId),
-                fileId: file._id,
-                type: 'topic',
-                title: file.originalName?.replace(/\.[^.]+$/, '') || 'Téma',
-                archived: false,
-                questions: qs,
-                strategy: strategy === 'ai' ? 'ai-v1' : 'fake-v1',
-            });
-            createdIds.push(t.id);
+        if (!files.length) {
+            this.logProgress(socketId, 100, 'No files in folder');
+            return { ok: false, reason: 'No files in folder' };
         }
 
-        // Final test (ze všech souborů složky)
-        const fileIds = files.map((f) => f._id.toString());
-        const fqs = await this.buildQuestionsFromFolder(fileIds, finalCount, strategy, mix);
-        if (fqs.length) {
-            const ft = await this.testModel.create({
-                ownerId: user.userId,
-                folderId: this.toObjId(folderId),
-                type: 'final',
-                title: `Final – ${folder.name ?? 'Lekce'}`,
-                archived: false,
-                questions: fqs,
-                strategy: strategy === 'ai' ? 'ai-v1' : 'fake-v1',
-            });
-            createdIds.push(ft.id);
+        const fileIdsStr = files.map((f) => String(f._id));
+
+        // 3) chunky všech souborů (trim už v dotazu – šetří payload)
+        const TRIM_CHARS = Number(process.env.AI_CHUNK_TRIM_CHARS ?? 900);
+        const docs = await this.chunkModel.aggregate([
+            { $match: { documentId: { $in: fileIdsStr } } },
+            { $sort: { documentId: 1, index: 1, _id: 1 } },
+            { $project: { documentId: 1, index: 1, text: { $substrCP: ['$text', 0, TRIM_CHARS] } } },
+        ]).exec();
+
+        if (!docs.length) {
+            this.logProgress(socketId, 100, 'No chunks for files (after trimming)');
+            return { ok: false, reason: 'No chunks for files' };
         }
 
-        if (!createdIds.length) {
-            throw new BadRequestException('No questions could be generated from chunks');
+        // Mapa chunkId -> fileId (pojistka pro doplnění s.f, když ho AI vynechá)
+        const chunkToFile = new Map<string, string>();
+        for (const d of docs as any[]) {
+            chunkToFile.set(String(d._id), String(d.documentId));
         }
-        return { createdTestIds: createdIds };
-    }
 
-    private async buildQuestionsFromFile(
-        fileId: string,
-        count: number,
-        strategy: 'fake' | 'ai',
-        mix?: any,
-    ): Promise<QuestionEntity[]> {
-        const sample = await this.chunkModel.aggregate([
-            { $match: { documentId: fileId } },
-            { $sample: { size: Math.max(count * 2, count) } },
-            { $project: { text: 1 } },
-        ]);
-        const chunks = sample.map((c: any) => ({ id: c._id.toString(), text: c.text, fileId }));
-
-        if (strategy === 'ai') {
-            const qs = await this.ai.generateFromChunks(chunks, count, mix);
-            if (qs.length) return qs.slice(0, count);
-        }
-        // fallback: fake (vícetypové otázky)
-        return chunks.slice(0, count).map((c, i) => makeFakeQuestion(c.text, fileId, i));
-    }
-
-    private async buildQuestionsFromFolder(
-        fileIds: string[],
-        count: number,
-        strategy: 'fake' | 'ai',
-        mix?: any,
-    ): Promise<QuestionEntity[]> {
-        const sample = await this.chunkModel.aggregate([
-            { $match: { documentId: { $in: fileIds } } },
-            { $sample: { size: Math.max(count * 2, count) } },
-            { $project: { text: 1, documentId: 1 } },
-        ]);
-        const chunks = sample.map((c: any) => ({
-            id: c._id.toString(),
-            text: c.text,
-            fileId: c.documentId?.toString(),
+        // 4) SelChunk seznam
+        const allSelChunks: SelChunk[] = (docs as any[]).map((d) => ({
+            id: String(d._id ?? ''),
+            text: String(d.text ?? ''),
+            fileId: String(d.documentId ?? ''),
+            index: typeof d.index === 'number' ? d.index : undefined,
         }));
 
-        if (strategy === 'ai') {
-            const qs = await this.ai.generateFromChunks(chunks, count, mix);
-            if (qs.length) return qs.slice(0, count);
+        // 5) Per-file okna (žádné míchání souborů v jednom okně)
+        const WINDOW_SIZE = Number(process.env.AI_WINDOW_SIZE ?? this.WINDOW_SIZE);
+        const PER_WINDOW_TARGET = Number(process.env.AI_PER_WINDOW_TARGET ?? this.PER_WINDOW_TARGET);
+        const perFileCap = Number(process.env.AI_PER_FILE_CAP ?? 24); // kolik chunků může selector vzít pro jeden soubor
+
+        // -> seskup chunky podle souboru
+        const chunksByFile = new Map<string, SelChunk[]>();
+
+        for (const sc of allSelChunks) {
+            const fid = sc.fileId ?? '';   // zúžíme na string
+            if (!fid) continue;            // bez fileId vynecháme (nechceš je v per-file)
+            const bucket = chunksByFile.get(fid);
+            if (bucket) bucket.push(sc);
+            else chunksByFile.set(fid, [sc]);
         }
-        // fallback: fake
-        return chunks.slice(0, count).map((c, i) => makeFakeQuestion(c.text, c.fileId, i));
-    }
 
-    // ===== ATTEMPTS =====
-    async createAttempt(testId: string, user: UserCtx) {
-        const t = await this.testModel.findById(testId).lean();
-        if (!t) throw new NotFoundException('Test not found');
-        const folder = await this.folderModel.findById(t.folderId).lean();
-        if (!folder) throw new NotFoundException('Folder missing');
-        this.ensureOwner(folder.ownerId, user);
-        if (t.archived) throw new BadRequestException('Test is archived');
+        // 6) Generování po souborech se stop-podmínkou topicCount
+        const allQuestionsPool: AiQuestion[] = []; // globální pool pro finál
+        const perFileResults: { fileId: string; count: number; testId?: string }[] = [];
 
-        const answers = new Array((t.questions ?? []).length).fill(null);
-        const att = await this.attemptModel.create({
-            ownerId: user.userId,
-            testId: t._id,
-            status: 'in_progress',
-            answers,
+        let fileIndex = 0;
+        for (const f of files) {
+            const fid = String(f._id);
+            const fileChunks = chunksByFile.get(fid) ?? [];
+
+            fileIndex++;
+            const filePctBase = 10 + Math.round((fileIndex - 1) * (70 / Math.max(1, files.length))); // jen pro hezčí progress
+
+            if (!fileChunks.length) {
+                perFileResults.push({ fileId: fid, count: 0 });
+                this.logProgress(socketId, filePctBase, `No chunks for file ${fid}`);
+                continue;
+            }
+
+            // Pro tento soubor nech selector vybrat jen jeho nejlepší chunky a poskládat okna
+            const windowsForFile = this.selector.selectBestChunks(fileChunks, {
+                perFileCap,
+                globalCap: perFileCap, // v per-file režimu klidně stejné číslo
+                windowSize: WINDOW_SIZE,
+                coalesceMaxChars: Number(process.env.AI_COALESCE_MAX_CHARS ?? 900),
+                coalesceMinChars: Number(process.env.AI_COALESCE_MIN_CHARS ?? 350),
+            });
+
+            if (!windowsForFile.length) {
+                perFileResults.push({ fileId: fid, count: 0 });
+                this.logProgress(socketId, filePctBase, `No quality chunks for file ${fid}`);
+                continue;
+            }
+
+            const perFileBag: AiQuestion[] = []; // sem sbíráme otázky jen z tohoto souboru
+
+            for (let wIdx = 0; wIdx < windowsForFile.length; wIdx++) {
+                const w = windowsForFile[wIdx].map(c => ({ id: c.id, text: c.text, fileId: c.fileId })) as PreflightChunk[];
+                const pct = filePctBase + Math.round(((wIdx + 1) / windowsForFile.length) * (70 / Math.max(1, files.length)));
+                this.logProgress(socketId, pct, `File ${fileIndex}/${files.length}: window ${wIdx + 1}/${windowsForFile.length} (${w.length} chunks)`);
+
+                // Volání AI pro toto okno
+                const res = await this.ai.generateQuestions({
+                    model,
+                    chunks: w,
+                    mix: this.scaleMix(mix, PER_WINDOW_TARGET),
+                    instruction: 'Vytvoř otázky podle mixu. Otázky musí vyplývat POUZE z dodaných úryvků. U každé otázky vyplň s.c (chunkId) a s.f (fileId).',
+                    socketId,
+                }, socketId);
+
+                const got: AiQuestion[] = Array.isArray(res?.questions) ? (res!.questions as AiQuestion[]) : [];
+                if (got.length) {
+                    // doplň meta s.f z chunkToFile, pokud chybí
+                    this.reconcileQuestionMeta(got, chunkToFile);
+
+                    // přidej do globálního poolu (pro finále)
+                    allQuestionsPool.push(...got);
+
+                    // filtr – ber jen otázky z tohoto souboru
+                    const fromThisFile = got.filter((q: any) => String(q?.s?.f ?? '') === fid);
+
+                    if (fromThisFile.length) {
+                        perFileBag.push(...fromThisFile);
+                    }
+                }
+
+                // stop podmínka – nasbírali jsme dost pro topic test?
+                if (perFileBag.length >= topicCount) break;
+            }
+
+            // Výběr do topic testu podle mixu (např. jen MCQ) a limitu topicCount
+            const pickedAiQs: AiQuestion[] = this.pickByMixAndTake(perFileBag, mix, topicCount);
+
+            if (!pickedAiQs.length) {
+                perFileResults.push({ fileId: fid, count: 0 });
+                continue;
+            }
+
+            // Ulož topic test pro tento soubor – DB-friendly klíče
+            const created = await this.testModel.create({
+                folderId,
+                uploaderId: user.userId,
+                questions: pickedAiQs.map((q) => this.mapToDbQuestion(q)),
+                model,
+                archived: false,
+                // sourceFileId: fid, // pokud chceš, přidej do schématu Test
+            });
+
+            perFileResults.push({ fileId: fid, count: pickedAiQs.length, testId: String(created._id) });
+        }
+
+        // 7) Finální test napříč všemi nasbíranými otázkami
+        this.logProgress(socketId, 94, 'Creating final test');
+
+        if (!allQuestionsPool.length) {
+            this.logProgress(socketId, 100, 'AI returned no valid questions');
+            return { ok: false, reason: 'AI returned no valid questions' };
+        }
+
+        const finalPicked: AiQuestion[] = this.pickByMixAndTake(allQuestionsPool, mix, finalCount);
+        if (!finalPicked.length) {
+            this.logProgress(socketId, 100, 'No questions for final test');
+            return { ok: false, reason: 'No questions for final test' };
+        }
+
+        const finalTest = await this.testModel.create({
+            folderId,
+            uploaderId: user.userId,
+            questions: finalPicked.map((q) => this.mapToDbQuestion(q)),
+            model,
+            archived: false,
+            // type: 'final'
         });
-        return { attemptId: att.id, total: answers.length, status: att.status };
-    }
 
-    /**
-     * Update odpovědí – flexibilní formát:
-     * - zpětně kompatibilní: { q, option:'A'|'B'|'C'|'D' }  -> uloží index 0..3
-     * - obecně: { q, value:any }                            -> uloží přímo (pro msq/tf/cloze/short/match/order)
-     * - také:  { q, index:number } / { q, indices:number[] } / { q, bool:boolean } / { q, cloze:string[] } / atd.
-     */
-    async updateAnswers(
-        attemptId: string,
-        user: UserCtx,
-        payload: {
-            answers: Array<
-                { q: number; option?: 'A' | 'B' | 'C' | 'D'; index?: number; indices?: number[]; bool?: boolean; cloze?: string[]; text?: string; match?: number[]; order?: number[]; value?: any; }
-            >
-        },
-    ) {
-        const att = await this.attemptModel.findById(attemptId);
-        if (!att) throw new NotFoundException('Attempt not found');
-        if (att.ownerId !== user.userId) throw new ForbiddenException('Not allowed');
-        if (att.status !== 'in_progress') throw new BadRequestException('Attempt already submitted');
-
-        if (!payload?.answers?.length) return { ok: true };
-
-        const mapLetter = (opt?: 'A' | 'B' | 'C' | 'D') =>
-            opt === 'A' ? 0 : opt === 'B' ? 1 : opt === 'C' ? 2 : opt === 'D' ? 3 : null;
-
-        for (const u of payload.answers) {
-            const i = u.q ?? -1;
-            if (i < 0 || i >= att.answers.length) continue;
-
-            // preferuj 'value', jinak odvodit z aliasů pro zpětnou kompatibilitu
-            let value: any = undefined;
-            if ('value' in u) value = (u as any).value;
-            else if ('option' in u) value = mapLetter(u.option as any);
-            else if ('index' in u) value = u.index;
-            else if ('indices' in u) value = u.indices;
-            else if ('bool' in u) value = u.bool;
-            else if ('cloze' in u) value = u.cloze;
-            else if ('text' in u) value = u.text;
-            else if ('match' in u) value = u.match;
-            else if ('order' in u) value = u.order;
-
-            (att.answers as any)[i] = value ?? null;
-        }
-
-        await att.save();
-        return { ok: true };
-    }
-
-    async submitAttempt(attemptId: string, user: UserCtx) {
-        const att = await this.attemptModel.findById(attemptId);
-        if (!att) throw new NotFoundException('Attempt not found');
-        if (att.ownerId !== user.userId) throw new ForbiddenException('Not allowed');
-        if (att.status !== 'in_progress') throw new BadRequestException('Already submitted');
-
-        const t = await this.testModel.findById(att.testId).lean();
-        if (!t) throw new NotFoundException('Test missing');
-
-        const total = (t.questions ?? []).length;
-        let score = 0;
-        for (let i = 0; i < total; i++) {
-            const q = (t.questions as QuestionEntity[])[i];
-            const ans = (att.answers as any)[i];
-            score += this.scoreOne(q, ans);
-        }
-
-        att.status = 'submitted';
-        att.score = score;
-        att.total = total;
-        att.submittedAt = new Date();
-        await att.save();
-
-        return { attemptId: att.id, score, total, submittedAt: att.submittedAt };
-    }
-
-    async getAttempt(attemptId: string, user: UserCtx) {
-        const att = await this.attemptModel.findById(attemptId).lean();
-        if (!att) throw new NotFoundException('Attempt not found');
-        if (att.ownerId !== user.userId) throw new ForbiddenException('Not allowed');
-
-        const t = await this.testModel.findById(att.testId).lean();
-        if (!t) throw new NotFoundException('Test missing');
+        this.logProgress(
+            socketId,
+            100,
+            `Done. Created ${perFileResults.filter(r => r.count > 0).length} topic tests + final (${finalPicked.length}).`,
+        );
 
         return {
-            id: att._id.toString(),
-            testId: att.testId.toString(),
-            status: att.status,
-            answers: att.answers,
-            score: att.score,
-            total: att.total ?? (t.questions ?? []).length,
-            submittedAt: att.submittedAt,
-            // test meta (bez správných odpovědí)
-            test: {
-                id: t._id.toString(),
-                title: t.title,
-                type: t.type,
-                questionCount: (t.questions ?? []).length,
-            },
+            ok: true,
+            perFile: perFileResults,
+            finalId: finalTest._id,
+            finalCount: finalPicked.length,
         };
     }
 
-    // ===== Scoring všech typů =====
-    private norm(s?: string) {
-        return (s ?? '').trim().toLowerCase();
+    // ====== Preflight (bez změny) ======
+    async preflight(folderId: string, user: { userId: string }, model: string) {
+        const files = await this.fileModel.find({
+            folderId: new Types.ObjectId(folderId),
+            uploaderId: user.userId,
+        }).lean();
+
+        if (!files.length) return { ok: false, reason: 'Folder has no files' };
+
+        const fileIdsStr = files.map((f) => String(f._id));
+        const rawChunks = await this.chunkModel
+            .find({ documentId: { $in: fileIdsStr } }, { text: 1 } as any)
+            .sort({ _id: 1 })
+            .lean();
+
+        if (!rawChunks.length) return { ok: false, reason: 'No chunks for selected files' };
+
+        const sample = rawChunks.slice(0, 64).map((c: any) => String(c.text ?? '').slice(0, 800));
+        const est = this.tokenBudget.estimatePromptSize(sample, 'Instruction example');
+
+        return {
+            ok: true,
+            files: files.length,
+            chunks: rawChunks.length,
+            estimatedTokens: est,
+            model,
+            windowSize: this.WINDOW_SIZE,
+            perWindowTarget: this.PER_WINDOW_TARGET,
+        };
     }
 
-    private scoreOne(q: QuestionEntity, ans: any): number {
-        switch (q.kind) {
-            case 'mcq': {
-                // očekáváme index číslem (0..N-1); zpětná kompatibilita: pokud přijde 'A'..'D'
-                const idx = typeof ans === 'string'
-                    ? ({ A: 0, B: 1, C: 2, D: 3 } as any)[ans] ?? null
-                    : typeof ans === 'number' ? ans : null;
-                if (!Array.isArray(q.correctIndices) || idx === null) return 0;
-                return q.correctIndices[0] === idx ? 1 : 0;
-            }
-            case 'msq': {
-                if (!Array.isArray(q.correctIndices) || !Array.isArray(ans)) return 0;
-                const a = [...ans].sort((x, y) => x - y);
-                const b = [...q.correctIndices].sort((x, y) => x - y);
-                return JSON.stringify(a) === JSON.stringify(b) ? 1 : 0;
-            }
-            case 'tf': {
-                if (typeof q.correctBool !== 'boolean' || typeof ans !== 'boolean') return 0;
-                return q.correctBool === ans ? 1 : 0;
-            }
-            case 'cloze': {
-                if (!Array.isArray(q.clozeAnswers) || !Array.isArray(ans)) return 0;
-                if (q.clozeAnswers.length !== ans.length) return 0;
-                for (let i = 0; i < ans.length; i++) {
-                    if (this.norm(q.clozeAnswers[i]) !== this.norm(ans[i])) return 0;
+    async listTestsForFolder(folderId: string, user: { userId: string }, includeArchived: boolean) {
+        return this.testModel.find({
+            folderId,
+            uploaderId: user.userId,
+            ...(includeArchived ? {} : { archived: false }),
+        }).lean();
+    }
+
+    async getPublicTest(id: string, user: { userId: string }) {
+        return this.testModel.findOne({ _id: id, uploaderId: user.userId }).lean();
+    }
+
+    // ---------- helpers ----------
+
+    private logProgress(socketId: string | undefined, percent: number, msg: string) {
+        this.logger.log(`[${percent}%] ${msg}`);
+        if (socketId) this.socketGateway.emitProgress(socketId, { percent, msg });
+    }
+
+    /** Normalizované škálování mixu na cílový count */
+    private scaleMix(mix: Record<string, number>, target: number): Record<string, number> {
+        const total = Object.values(mix || {}).reduce((a, b) => a + Number(b || 0), 0) || 1;
+        const factor = Math.max(1, total) > 0 ? target / total : 1;
+        const out: Record<string, number> = {};
+        for (const [k, v] of Object.entries(mix || {})) {
+            out[k.toLowerCase().trim()] = Math.max(0, Math.round((Number(v || 0)) * factor));
+        }
+        if (Object.values(out).every((n) => n <= 0)) out['mcq'] = Math.max(1, target);
+        return out;
+    }
+
+    /** Doplní chybějící s.f (fileId) z mapy chunkId → fileId (ponechá s.c, pokud je) */
+    private reconcileQuestionMeta(qs: AiQuestion[], chunkToFile: Map<string, string>) {
+        for (const q of qs as any[]) {
+            const s = q.s ?? (q.s = {});
+            if (!s.f) {
+                const c = s.c;
+                if (typeof c === 'string' && chunkToFile.has(c)) {
+                    s.f = chunkToFile.get(c);
                 }
-                return 1;
             }
-            case 'short': {
-                if (!Array.isArray(q.acceptableAnswers)) return 0;
-                return q.acceptableAnswers.some(x => this.norm(x) === this.norm(ans)) ? 1 : 0;
-            }
-            case 'match': {
-                // ans: number[] (mapování left -> right index); správné je i -> i
-                if (!Array.isArray(q.matchLeft) || !Array.isArray(q.matchRight) || !Array.isArray(ans)) return 0;
-                if (q.matchLeft.length !== ans.length) return 0;
-                for (let i = 0; i < q.matchLeft.length; i++) if (ans[i] !== i) return 0;
-                return 1;
-            }
-            case 'order': {
-                // ans: number[] pořadí indexů položek; správné je [0,1,2,...]
-                if (!Array.isArray(q.orderItems) || !Array.isArray(ans)) return 0;
-                if (q.orderItems.length !== ans.length) return 0;
-                for (let i = 0; i < q.orderItems.length; i++) if (ans[i] !== i) return 0;
-                return 1;
-            }
+        }
+    }
+
+    /** Vybere otázky dle mixu (typů) a omezí celkovým počtem */
+    private pickByMixAndTake(qs: AiQuestion[], mix: Record<string, number>, count: number): AiQuestion[] {
+        const caps = this.scaleMix(mix, count);
+        const allowed = Object.keys(caps).filter(k => caps[k] > 0);
+
+        // promíchání (Fisher–Yates)
+        const shuffled: AiQuestion[] = [...qs];
+        for (let i = shuffled.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+        }
+
+        const used: Record<string, number> = {};
+        const out: AiQuestion[] = [];
+        for (const q of shuffled as any[]) {
+            const k = String(q.k).toLowerCase().trim();
+            if (allowed.length && !allowed.includes(k)) continue;
+            const u = used[k] ?? 0;
+            if (u >= (caps[k] ?? 0)) continue;
+            out.push(q);
+            used[k] = u + 1;
+            if (out.length >= count) break;
+        }
+        return out.slice(0, count);
+    }
+
+    /** UI-sanitizace (odstraní "(c:..., f:...)" a "Podle úryvku:" apod.) */
+    private sanitizeTextForUi(s: string): string {
+        if (!s) return s;
+        let x = s;
+
+        // (c:HEX f:HEX) / (c:HEX)
+        x = x.replace(/\(\s*c:[0-9a-f]{8,}\s*(?:f:\s*[0-9a-f]{8,}\s*)?\)/gi, '');
+        // standalone c:HEX / f:HEX
+        x = x.replace(/\b[cf]:[0-9a-f]{8,}\b/gi, '');
+        // "Podle/Dle úryvku ..." na začátku
+        x = x.replace(/^\s*(?:podle|dle)\s+úryvku(?:\s*\([^)]+\))?\s*:\s*/i, '');
+        // volitelně: "viz úryvek/text:"
+        x = x.replace(/^\s*viz\s+(?:úryvek|text)\s*:\s*/i, '');
+        // whitespace
+        x = x.replace(/\s{2,}/g, ' ').replace(/\s+([,.!?;:])/g, '$1').trim();
+        return x;
+    }
+
+    /** Map AiQuestion → DB-friendly tvar (se sanitizací textů) */
+    private mapToDbQuestion(q: AiQuestion & { s?: { c?: string; f?: string } }): DbQuestion {
+        const anyQ = q as any;
+        const meta = { chunkId: anyQ?.s?.c, fileId: anyQ?.s?.f };
+        const clean = (s: string) => this.sanitizeTextForUi(String(s ?? ''));
+
+        switch (anyQ.k) {
+            case 'mcq':
+            case 'msq':
+                return {
+                    type: anyQ.k,
+                    text: clean(anyQ.t),
+                    choices: (anyQ.o ?? []).map((x: any) => clean(String(x ?? ''))),
+                    correct: anyQ.ci ?? [],
+                    meta
+                };
+            case 'tf':
+                return { type: 'tf', text: clean(anyQ.t), truth: Boolean(anyQ.r), meta };
+            case 'short':
+                return { type: 'short', text: clean(anyQ.t), answer: String(anyQ.r ?? ''), meta };
+            case 'cloze':
+                return { type: 'cloze', text: clean(anyQ.t), gaps: (anyQ.g ?? []).map((x: any) => clean(String(x ?? ''))), meta };
+            case 'match':
+                return { type: 'match', text: clean(anyQ.t), left: (anyQ.l ?? []).map((x: any) => clean(String(x ?? ''))), right: (anyQ.r ?? []).map((x: any) => clean(String(x ?? ''))), meta };
+            case 'order':
+                return { type: 'order', text: clean(anyQ.t), items: (anyQ.o ?? []).map((x: any) => clean(String(x ?? ''))), meta };
             default:
-                return 0;
+                return {
+                    type: 'mcq',
+                    text: clean(anyQ.t),
+                    choices: (anyQ.o ?? []).map((x: any) => clean(String(x ?? ''))),
+                    correct: anyQ.ci ?? [],
+                    meta
+                };
         }
     }
 }
