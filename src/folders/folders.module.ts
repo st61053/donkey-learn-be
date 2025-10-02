@@ -3,6 +3,7 @@ import { MongooseModule } from '@nestjs/mongoose';
 import { Folder, FolderSchema } from './schemas/folder.schema';
 import { FoldersController } from './folders.controller';
 import { StoredFile, StoredFileSchema } from '../files/schemas/file.schema';
+import { FoldersService } from './folders.service';
 
 @Module({
     imports: [
@@ -11,6 +12,7 @@ import { StoredFile, StoredFileSchema } from '../files/schemas/file.schema';
             { name: StoredFile.name, schema: StoredFileSchema }, // pro kontrolu „Folder not empty“
         ]),
     ],
+    providers: [FoldersService],
     controllers: [FoldersController],
     exports: [MongooseModule],
 })

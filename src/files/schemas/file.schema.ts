@@ -70,3 +70,5 @@ export class FileResponseDto {
     @ApiProperty({ example: '2025-08-29T18:04:12.345Z' })
     updatedAt: string;
 }
+
+StoredFileSchema.index({ uploaderId: 1, folderId: 1, createdAt: -1 });

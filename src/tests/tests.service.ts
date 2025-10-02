@@ -1,19 +1,21 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
-import { Model, Types } from 'mongoose';
+import { Model } from 'mongoose';
 import { TestDocument, Test } from './schemas/test.schema';
 import { StoredFile } from '../files/schemas/file.schema';
 import { Chunk } from '../files/schemas/chunk.schema';
-import { GenerateFolderTestsDto } from './dto/generate-folder-tests.dto';
 import { AiService } from '../ai/ai.service';
 import { TokenBudgetService } from '../ai/token-budget.service';
 import { SocketGateway } from './ws/socket.gateway';
 import { AiQuestion } from '../ai/dto/ai-response.dto';
-import { ChunkSelectorService, SelChunk } from '../ai/chunk-selector.service';
+import { ChunkSelectorService } from '../ai/chunk-selector.service';
+import { MinioService } from 'src/minio/minio.service';
+import { FilesService } from 'src/files/files.service';
+import { randomUUID } from 'crypto';
 
 type PreflightChunk = { id: string; text: string; fileId?: string };
 
-// Lokální DB-friendly tvar otázky (nemusíš exportovat; je to jen pro typovou pohodu)
+// Lokální DB-friendly tvar otázky
 type DbQuestion =
     | { type: 'mcq' | 'msq'; text: string; choices: string[]; correct: number[]; meta: { chunkId?: string; fileId?: string } }
     | { type: 'tf'; text: string; truth: boolean; meta: { chunkId?: string; fileId?: string } }
@@ -38,256 +40,284 @@ export class TestsService {
         private readonly tokenBudget: TokenBudgetService,
         private readonly socketGateway: SocketGateway,
         private readonly selector: ChunkSelectorService,
+        private readonly minio: MinioService,
+        private readonly files: FilesService,
     ) { }
 
     /**
-     * Per-file generování:
-     *  - pro KAŽDÝ soubor poskládáme okna jen z jeho chunků a voláme AI
-     *  - zastavíme se, jakmile nasbíráme ≥ topicCount otázek pro daný soubor (nebo dojdou okna)
-     *  - pak vytvoříme finální test z celého poolu (napříč soubory) o velikosti finalCount
+     * 1) uloží nahraný soubor do MinIO + DB (StoredFile)
+     * 2) naparsuje ho na chunky (FilesService.parseAndChunkForUser)
+     * 3) vybere chunky do oken a iterativně zavolá AI dle mixu (dynamické cíle + backfill)
+     * 4) vytvoří a vrátí uložený Test
+     *
+     * Posílá průběžné logy na FE pomocí socketId.
      */
-    async generateForFolder(folderId: string, user: { userId: string }, dto: GenerateFolderTestsDto) {
-        const {
-            topicCount = 4,       // kolik otázek do topic testu pro každý soubor
-            finalCount = 6,       // finální test
-            archiveExisting = true,
-            strategy = 'ai',
-            mix = { mcq: 5 },     // např. jen MCQ
-            model = process.env.OPENAI_MODEL || 'gpt-4o-mini',
-            socketId,
-        } = dto;
-
-        this.logProgress(socketId, 0, 'Starting folder generation');
-
-        // 1) archivace existujících testů (volitelně)
-        if (archiveExisting) {
-            await this.testModel.updateMany(
-                { folderId, uploaderId: user.userId, archived: false },
-                { archived: true },
-            );
-            this.logProgress(socketId, 3, 'Archived existing tests');
-        }
-
-        // 2) soubory ve složce
-        const files = await this.fileModel.find({
-            folderId: new Types.ObjectId(folderId),
-            uploaderId: user.userId,
-        }).lean();
-
-        if (!files.length) {
-            this.logProgress(socketId, 100, 'No files in folder');
-            return { ok: false, reason: 'No files in folder' };
-        }
-
-        const fileIdsStr = files.map((f) => String(f._id));
-
-        // 3) chunky všech souborů (trim už v dotazu – šetří payload)
+    async generateFromSingleFile(
+        folderId: string,
+        user: { userId: string },
+        dto: { title: string; duration: number; mix: Record<string, number>; model?: string },
+        file: Express.Multer.File,
+        socketId?: string,
+    ) {
+        const model = dto.model || process.env.OPENAI_MODEL || 'gpt-5-mini';
         const TRIM_CHARS = Number(process.env.AI_CHUNK_TRIM_CHARS ?? 900);
-        const docs = await this.chunkModel.aggregate([
-            { $match: { documentId: { $in: fileIdsStr } } },
-            { $sort: { documentId: 1, index: 1, _id: 1 } },
-            { $project: { documentId: 1, index: 1, text: { $substrCP: ['$text', 0, TRIM_CHARS] } } },
-        ]).exec();
-
-        if (!docs.length) {
-            this.logProgress(socketId, 100, 'No chunks for files (after trimming)');
-            return { ok: false, reason: 'No chunks for files' };
-        }
-
-        // Mapa chunkId -> fileId (pojistka pro doplnění s.f, když ho AI vynechá)
-        const chunkToFile = new Map<string, string>();
-        for (const d of docs as any[]) {
-            chunkToFile.set(String(d._id), String(d.documentId));
-        }
-
-        // 4) SelChunk seznam
-        const allSelChunks: SelChunk[] = (docs as any[]).map((d) => ({
-            id: String(d._id ?? ''),
-            text: String(d.text ?? ''),
-            fileId: String(d.documentId ?? ''),
-            index: typeof d.index === 'number' ? d.index : undefined,
-        }));
-
-        // 5) Per-file okna (žádné míchání souborů v jednom okně)
         const WINDOW_SIZE = Number(process.env.AI_WINDOW_SIZE ?? this.WINDOW_SIZE);
-        const PER_WINDOW_TARGET = Number(process.env.AI_PER_WINDOW_TARGET ?? this.PER_WINDOW_TARGET);
-        const perFileCap = Number(process.env.AI_PER_FILE_CAP ?? 24); // kolik chunků může selector vzít pro jeden soubor
 
-        // -> seskup chunky podle souboru
-        const chunksByFile = new Map<string, SelChunk[]>();
+        // --- 0) Start ---
+        this.logProgress(socketId, 0, 'Příjem souboru…');
 
-        for (const sc of allSelChunks) {
-            const fid = sc.fileId ?? '';   // zúžíme na string
-            if (!fid) continue;            // bez fileId vynecháme (nechceš je v per-file)
-            const bucket = chunksByFile.get(fid);
-            if (bucket) bucket.push(sc);
-            else chunksByFile.set(fid, [sc]);
-        }
+        try {
+            // --- 1) Uložit soubor do MinIO + DB ---
+            const ext = (file.originalname.split('.').pop() || '').toLowerCase();
+            const objectName = `${new Date().toISOString().slice(0, 10)}/${randomUUID()}${ext ? '.' + ext : ''}`;
 
-        // 6) Generování po souborech se stop-podmínkou topicCount
-        const allQuestionsPool: AiQuestion[] = []; // globální pool pro finál
-        const perFileResults: { fileId: string; count: number; testId?: string }[] = [];
+            this.logProgress(socketId, 5, 'Nahrávám soubor do objektového úložiště…');
+            await this.minio.uploadObject(objectName, file.buffer, file.mimetype);
 
-        let fileIndex = 0;
-        for (const f of files) {
-            const fid = String(f._id);
-            const fileChunks = chunksByFile.get(fid) ?? [];
+            this.logProgress(socketId, 10, 'Zakládám záznam souboru…');
+            const createdFile = await this.files.create({
+                originalName: file.originalname,
+                key: objectName,
+                bucket: this.minio.bucketName(),
+                mime: file.mimetype,
+                size: file.size,
+                uploaderId: user.userId,
+                folderId,
+            });
 
-            fileIndex++;
-            const filePctBase = 10 + Math.round((fileIndex - 1) * (70 / Math.max(1, files.length))); // jen pro hezčí progress
+            const sourceFileId = (createdFile as any)?._id?.toString?.() ?? (createdFile as any).id;
 
-            if (!fileChunks.length) {
-                perFileResults.push({ fileId: fid, count: 0 });
-                this.logProgress(socketId, filePctBase, `No chunks for file ${fid}`);
-                continue;
+            // --- 2) Parse & chunk ---
+            this.logProgress(socketId, 15, 'Parsování souboru a dělení na úryvky…');
+            const { chunksInserted } = await this.files.parseAndChunkForUser(
+                sourceFileId,
+                user,
+                Number(process.env.AI_CHUNK_SIZE ?? 1000),
+                Number(process.env.AI_CHUNK_OVERLAP ?? 150),
+            );
+            if (!chunksInserted) {
+                this.logProgress(socketId, 100, 'Zpracování selhalo: z dokumentu nevznikly žádné úryvky.');
+                return { ok: false, reason: 'No chunks produced from file' };
+            }
+            this.logProgress(socketId, 25, `Vytvořeno úryvků: ${chunksInserted}. Načítám…`);
+
+            // --- 3) Načti chunky a připrav výběr ---
+            const rawChunks = await this.chunkModel
+                .find({ documentId: sourceFileId }, { text: 1, index: 1 } as any)
+                .sort({ index: 1, _id: 1 })
+                .lean();
+
+            if (!rawChunks.length) {
+                this.logProgress(socketId, 100, 'Zpracování selhalo: po parsování nebyly nalezeny úryvky.');
+                return { ok: false, reason: 'No chunks found (after parsing)' };
             }
 
-            // Pro tento soubor nech selector vybrat jen jeho nejlepší chunky a poskládat okna
-            const windowsForFile = this.selector.selectBestChunks(fileChunks, {
-                perFileCap,
-                globalCap: perFileCap, // v per-file režimu klidně stejné číslo
+            // mapa chunkId → fileId
+            const chunkToFile = new Map<string, string>();
+            const selChunks = rawChunks.map((c: any) => {
+                const id = String(c._id);
+                chunkToFile.set(id, sourceFileId);
+                return {
+                    id,
+                    fileId: sourceFileId,
+                    index: typeof c.index === 'number' ? c.index : undefined,
+                    text: String(c.text ?? '').slice(0, TRIM_CHARS),
+                };
+            });
+
+            this.logProgress(socketId, 30, 'Výběr nejlepších úryvků a skládání oken…');
+            const windows = this.selector.selectBestChunks(selChunks, {
+                perFileCap: Number(process.env.AI_PER_FILE_CAP ?? 64),
+                globalCap: Number(process.env.AI_GLOBAL_CAP ?? 64),
                 windowSize: WINDOW_SIZE,
                 coalesceMaxChars: Number(process.env.AI_COALESCE_MAX_CHARS ?? 900),
                 coalesceMinChars: Number(process.env.AI_COALESCE_MIN_CHARS ?? 350),
             });
 
-            if (!windowsForFile.length) {
-                perFileResults.push({ fileId: fid, count: 0 });
-                this.logProgress(socketId, filePctBase, `No quality chunks for file ${fid}`);
-                continue;
+            if (!windows.length) {
+                this.logProgress(socketId, 100, 'Zpracování selhalo: nepodařilo se vytvořit kvalitní okna.');
+                return { ok: false, reason: 'No quality windows' };
+            }
+            this.logProgress(socketId, 35, `Launching question generation…`);
+
+            // ====== DYNAMICKÉ CÍLE + BACKFILL ======
+            const totalRequested = Object.values(dto.mix || {}).reduce((a, b) => a + Number(b || 0), 0);
+            const collected: any[] = [];
+
+            const countByKind = (arr: any[]) =>
+                arr.reduce<Record<string, number>>((acc, q: any) => {
+                    const k = String(q?.k || '').toLowerCase();
+                    acc[k] = (acc[k] ?? 0) + 1;
+                    return acc;
+                }, {});
+
+            const remainingMix = (mix: Record<string, number>, collectedSoFar: any[]) => {
+                const have = countByKind(collectedSoFar);
+                const out: Record<string, number> = {};
+                for (const [k, v] of Object.entries(mix || {})) {
+                    const left = Math.max(0, Number(v || 0) - (have[k] ?? 0));
+                    if (left > 0) out[k] = left;
+                }
+                return out;
+            };
+
+            const dynTargetForWindow = (remaining: number, windowsLeft: number) =>
+                Math.max(1, Math.ceil(remaining / Math.max(1, windowsLeft)));
+
+            // průběžné procenta pro okna: 35% → 80%
+            const progressStart = 35;
+            const progressEnd = 80;
+            const progressSpan = progressEnd - progressStart;
+
+            for (let i = 0; i < windows.length; i++) {
+                const remainingTotal = Math.max(0, totalRequested - collected.length);
+                if (remainingTotal <= 0) break;
+
+                const wleft = windows.length - i;
+                const targetThisWindow = dynTargetForWindow(remainingTotal, wleft);
+                const mixLeft = remainingMix(dto.mix, collected);
+                if (!Object.keys(mixLeft).length) break;
+
+                const perWindowMix = this.scaleMix(mixLeft, targetThisWindow);
+
+                const w = windows[i].map((c) => ({
+                    id: c.id,
+                    fileId: c.fileId ?? selChunks[0].fileId,
+                    text: String(c.text ?? '').slice(0, TRIM_CHARS),
+                }));
+
+                const pctBefore = progressStart + Math.floor((i / Math.max(1, windows.length)) * progressSpan);
+                // this.logProgress(
+                //     socketId,
+                //     Math.min(79, pctBefore),
+                //     `Okno ${i + 1}/${windows.length}: požaduji ${targetThisWindow} (mix: ${JSON.stringify(perWindowMix)})`,
+                // );
+
+                const res = await this.ai.generateQuestions(
+                    {
+                        model,
+                        chunks: w,
+                        mix: perWindowMix,
+                        instruction:
+                            'Vytvoř otázky podle mixu. Otázky musí vyplývat POUZE z dodaných úryvků. ' +
+                            'U každé otázky vyplň s.c (chunkId) a s.f (fileId).',
+                    },
+                    socketId, // pokud tvoje AiService umí logovat na socket, přepošleme
+                );
+
+                const got = Array.isArray(res?.questions) ? (res!.questions as any[]) : [];
+                if (got.length) {
+                    this.reconcileQuestionMeta(got, chunkToFile);
+                    collected.push(...got);
+                }
+
+                const pctAfter = progressStart + Math.floor(((i + 1) / Math.max(1, windows.length)) * progressSpan);
+                this.logProgress(
+                    socketId,
+                    Math.min(80, pctAfter),
+                    `Questions prepared — ${collected.length}/${totalRequested}`,
+                );
             }
 
-            const perFileBag: AiQuestion[] = []; // sem sbíráme otázky jen z tohoto souboru
+            // backfill – 80% → 88% (1. průchod), 88% → 92% (2. průchod)
+            const backfillOnce = async (targetCount: number, pass: number, startPct: number, endPct: number) => {
+                const leftMix = remainingMix(dto.mix, collected);
+                const leftTotal = Object.values(leftMix).reduce((a, b) => a + b, 0);
+                if (leftTotal <= 0) return;
 
-            for (let wIdx = 0; wIdx < windowsForFile.length; wIdx++) {
-                const w = windowsForFile[wIdx].map(c => ({ id: c.id, text: c.text, fileId: c.fileId })) as PreflightChunk[];
-                const pct = filePctBase + Math.round(((wIdx + 1) / windowsForFile.length) * (70 / Math.max(1, files.length)));
-                this.logProgress(socketId, pct, `File ${fileIndex}/${files.length}: window ${wIdx + 1}/${windowsForFile.length} (${w.length} chunks)`);
+                this.logProgress(socketId, startPct, `Backfill #${pass}: doplňuji chybějící typy (mix: ${JSON.stringify(leftMix)})`);
 
-                // Volání AI pro toto okno
-                const res = await this.ai.generateQuestions({
-                    model,
-                    chunks: w,
-                    mix: this.scaleMix(mix, PER_WINDOW_TARGET),
-                    instruction: 'Vytvoř otázky podle mixu. Otázky musí vyplývat POUZE z dodaných úryvků. U každé otázky vyplň s.c (chunkId) a s.f (fileId).',
-                    socketId,
-                }, socketId);
-
-                const got: AiQuestion[] = Array.isArray(res?.questions) ? (res!.questions as AiQuestion[]) : [];
-                if (got.length) {
-                    // doplň meta s.f z chunkToFile, pokud chybí
-                    this.reconcileQuestionMeta(got, chunkToFile);
-
-                    // přidej do globálního poolu (pro finále)
-                    allQuestionsPool.push(...got);
-
-                    // filtr – ber jen otázky z tohoto souboru
-                    const fromThisFile = got.filter((q: any) => String(q?.s?.f ?? '') === fid);
-
-                    if (fromThisFile.length) {
-                        perFileBag.push(...fromThisFile);
+                const seen = new Set<string>();
+                const merged: { id: string; fileId: string; text: string }[] = [];
+                for (const win of windows) {
+                    for (const c of win) {
+                        if (seen.has(c.id)) continue;
+                        seen.add(c.id);
+                        merged.push({
+                            id: c.id,
+                            fileId: c.fileId ?? selChunks[0].fileId,
+                            text: String(c.text ?? '').slice(0, TRIM_CHARS),
+                        });
                     }
                 }
 
-                // stop podmínka – nasbírali jsme dost pro topic test?
-                if (perFileBag.length >= topicCount) break;
+                const perMix = this.scaleMix(leftMix, targetCount);
+
+                const res = await this.ai.generateQuestions(
+                    {
+                        model,
+                        chunks: merged,
+                        mix: perMix,
+                        instruction:
+                            'BACKFILL: Doplň chybějící otázky podle mixu výhradně z poskytnutých úryvků. ' +
+                            'U každé otázky vyplň s.c (chunkId) a s.f (fileId).',
+                    },
+                    socketId,
+                );
+
+                const got = Array.isArray(res?.questions) ? (res!.questions as any[]) : [];
+                if (got.length) {
+                    this.reconcileQuestionMeta(got, chunkToFile);
+                    collected.push(...got);
+                }
+                this.logProgress(socketId, endPct, `Backfill #${pass} hotov (+${got.length} ot.), celkem ${collected.length}/${totalRequested}.`);
+            };
+
+            let stillMissing = Math.max(0, totalRequested - collected.length);
+            if (stillMissing > 0) await backfillOnce(stillMissing, 1, 80, 88);
+            stillMissing = Math.max(0, totalRequested - collected.length);
+            if (stillMissing > 0) await backfillOnce(Math.min(stillMissing, 16), 2, 88, 92);
+
+            // finální výběr přes mix a limit
+            this.logProgress(socketId, 92, 'Finalizuji výběr otázek dle cílového mixu…');
+            const finalPicked = this.pickByMixAndTake(collected, dto.mix, totalRequested);
+            const finalPickedShuffled = finalPicked.map((q) => this.shuffleMcqMsq(q));
+            if (!finalPicked.length) {
+                this.logProgress(socketId, 100, 'Zpracování selhalo: nemám žádné otázky pro finální test.');
+                return { ok: false, reason: 'No questions for final test' };
             }
 
-            // Výběr do topic testu podle mixu (např. jen MCQ) a limitu topicCount
-            const pickedAiQs: AiQuestion[] = this.pickByMixAndTake(perFileBag, mix, topicCount);
-
-            if (!pickedAiQs.length) {
-                perFileResults.push({ fileId: fid, count: 0 });
-                continue;
-            }
-
-            // Ulož topic test pro tento soubor – DB-friendly klíče
-            const created = await this.testModel.create({
+            // --- 4) Uložit Test ---
+            this.logProgress(socketId, 95, 'Ukládám test do databáze…');
+            const testDoc = await this.testModel.create({
                 folderId,
                 uploaderId: user.userId,
-                questions: pickedAiQs.map((q) => this.mapToDbQuestion(q)),
+                title: dto.title,
+                duration: dto.duration,
+                mix: dto.mix,
+                questions: finalPickedShuffled.map((q) => this.mapToDbQuestion(q)),
                 model,
                 archived: false,
-                // sourceFileId: fid, // pokud chceš, přidej do schématu Test
             });
 
-            perFileResults.push({ fileId: fid, count: pickedAiQs.length, testId: String(created._id) });
+            this.logProgress(socketId, 100, 'Hotovo! Test byl úspěšně vygenerován.');
+
+            return {
+                ok: true,
+                testId: String(testDoc._id),
+                fileId: sourceFileId,
+                generated: finalPicked.length,
+                requested: totalRequested,
+                windows: windows.length,
+            };
+        } catch (err: any) {
+            this.logger.error('generateFromSingleFile error', err?.stack || err);
+            this.logProgress(socketId, 100, `Chyba: ${err?.message || 'Neznámá chyba při generování.'}`);
+            throw err;
         }
-
-        // 7) Finální test napříč všemi nasbíranými otázkami
-        this.logProgress(socketId, 94, 'Creating final test');
-
-        if (!allQuestionsPool.length) {
-            this.logProgress(socketId, 100, 'AI returned no valid questions');
-            return { ok: false, reason: 'AI returned no valid questions' };
-        }
-
-        const finalPicked: AiQuestion[] = this.pickByMixAndTake(allQuestionsPool, mix, finalCount);
-        if (!finalPicked.length) {
-            this.logProgress(socketId, 100, 'No questions for final test');
-            return { ok: false, reason: 'No questions for final test' };
-        }
-
-        const finalTest = await this.testModel.create({
-            folderId,
-            uploaderId: user.userId,
-            questions: finalPicked.map((q) => this.mapToDbQuestion(q)),
-            model,
-            archived: false,
-            // type: 'final'
-        });
-
-        this.logProgress(
-            socketId,
-            100,
-            `Done. Created ${perFileResults.filter(r => r.count > 0).length} topic tests + final (${finalPicked.length}).`,
-        );
-
-        return {
-            ok: true,
-            perFile: perFileResults,
-            finalId: finalTest._id,
-            finalCount: finalPicked.length,
-        };
-    }
-
-    // ====== Preflight (bez změny) ======
-    async preflight(folderId: string, user: { userId: string }, model: string) {
-        const files = await this.fileModel.find({
-            folderId: new Types.ObjectId(folderId),
-            uploaderId: user.userId,
-        }).lean();
-
-        if (!files.length) return { ok: false, reason: 'Folder has no files' };
-
-        const fileIdsStr = files.map((f) => String(f._id));
-        const rawChunks = await this.chunkModel
-            .find({ documentId: { $in: fileIdsStr } }, { text: 1 } as any)
-            .sort({ _id: 1 })
-            .lean();
-
-        if (!rawChunks.length) return { ok: false, reason: 'No chunks for selected files' };
-
-        const sample = rawChunks.slice(0, 64).map((c: any) => String(c.text ?? '').slice(0, 800));
-        const est = this.tokenBudget.estimatePromptSize(sample, 'Instruction example');
-
-        return {
-            ok: true,
-            files: files.length,
-            chunks: rawChunks.length,
-            estimatedTokens: est,
-            model,
-            windowSize: this.WINDOW_SIZE,
-            perWindowTarget: this.PER_WINDOW_TARGET,
-        };
     }
 
     async listTestsForFolder(folderId: string, user: { userId: string }, includeArchived: boolean) {
-        return this.testModel.find({
-            folderId,
-            uploaderId: user.userId,
-            ...(includeArchived ? {} : { archived: false }),
-        }).lean();
+        return this.testModel
+            .find(
+                {
+                    folderId,
+                    uploaderId: user.userId,
+                    ...(includeArchived ? {} : { archived: false }),
+                }
+            )
+            .sort({ createdAt: 1, _id: 1 }) // ↑ nejstarší → nejnovější (tie-break přes _id)
+            .lean();
     }
 
     async getPublicTest(id: string, user: { userId: string }) {
@@ -307,13 +337,13 @@ export class TestsService {
         const factor = Math.max(1, total) > 0 ? target / total : 1;
         const out: Record<string, number> = {};
         for (const [k, v] of Object.entries(mix || {})) {
-            out[k.toLowerCase().trim()] = Math.max(0, Math.round((Number(v || 0)) * factor));
+            out[k.toLowerCase().trim()] = Math.max(0, Math.round(Number(v || 0) * factor));
         }
         if (Object.values(out).every((n) => n <= 0)) out['mcq'] = Math.max(1, target);
         return out;
     }
 
-    /** Doplní chybějící s.f (fileId) z mapy chunkId → fileId (ponechá s.c, pokud je) */
+    /** Doplní chybějící s.f (fileId) z mapy chunkId → fileId */
     private reconcileQuestionMeta(qs: AiQuestion[], chunkToFile: Map<string, string>) {
         for (const q of qs as any[]) {
             const s = q.s ?? (q.s = {});
@@ -329,7 +359,7 @@ export class TestsService {
     /** Vybere otázky dle mixu (typů) a omezí celkovým počtem */
     private pickByMixAndTake(qs: AiQuestion[], mix: Record<string, number>, count: number): AiQuestion[] {
         const caps = this.scaleMix(mix, count);
-        const allowed = Object.keys(caps).filter(k => caps[k] > 0);
+        const allowed = Object.keys(caps).filter((k) => caps[k] > 0);
 
         // promíchání (Fisher–Yates)
         const shuffled: AiQuestion[] = [...qs];
@@ -352,7 +382,7 @@ export class TestsService {
         return out.slice(0, count);
     }
 
-    /** UI-sanitizace (odstraní "(c:..., f:...)" a "Podle úryvku:" apod.) */
+    /** UI-sanitizace textu */
     private sanitizeTextForUi(s: string): string {
         if (!s) return s;
         let x = s;
@@ -384,7 +414,7 @@ export class TestsService {
                     text: clean(anyQ.t),
                     choices: (anyQ.o ?? []).map((x: any) => clean(String(x ?? ''))),
                     correct: anyQ.ci ?? [],
-                    meta
+                    meta,
                 };
             case 'tf':
                 return { type: 'tf', text: clean(anyQ.t), truth: Boolean(anyQ.r), meta };
@@ -393,7 +423,13 @@ export class TestsService {
             case 'cloze':
                 return { type: 'cloze', text: clean(anyQ.t), gaps: (anyQ.g ?? []).map((x: any) => clean(String(x ?? ''))), meta };
             case 'match':
-                return { type: 'match', text: clean(anyQ.t), left: (anyQ.l ?? []).map((x: any) => clean(String(x ?? ''))), right: (anyQ.r ?? []).map((x: any) => clean(String(x ?? ''))), meta };
+                return {
+                    type: 'match',
+                    text: clean(anyQ.t),
+                    left: (anyQ.l ?? []).map((x: any) => clean(String(x ?? ''))),
+                    right: (anyQ.r ?? []).map((x: any) => clean(String(x ?? ''))),
+                    meta,
+                };
             case 'order':
                 return { type: 'order', text: clean(anyQ.t), items: (anyQ.o ?? []).map((x: any) => clean(String(x ?? ''))), meta };
             default:
@@ -402,8 +438,46 @@ export class TestsService {
                     text: clean(anyQ.t),
                     choices: (anyQ.o ?? []).map((x: any) => clean(String(x ?? ''))),
                     correct: anyQ.ci ?? [],
-                    meta
+                    meta,
                 };
         }
     }
+
+    // Fisher–Yates (deterministiku můžeš udělat přes seed, ale pro začátek stačí Math.random)
+    private shuffleArrayInPlace<T>(arr: T[]): void {
+        for (let i = arr.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [arr[i], arr[j]] = [arr[j], arr[i]];
+        }
+    }
+
+    /** Zamíchá pořadí možností u MCQ/MSQ a přemapuje správné indexy (ci). */
+    private shuffleMcqMsq(q: AiQuestion): AiQuestion {
+        if (q.k !== 'mcq' && q.k !== 'msq') return q;
+
+        const choices = Array.isArray(q.o) ? [...q.o] : [];
+        if (choices.length < 2) return q;
+
+        // vytvoř pole původních indexů a zamíchej je
+        const order = Array.from({ length: choices.length }, (_, i) => i);
+        this.shuffleArrayInPlace(order);
+
+        // nové pořadí možností
+        const shuffledChoices = order.map((oldIdx) => choices[oldIdx]);
+
+        // mapování: původní index -> nová pozice
+        const oldToNew = new Map<number, number>();
+        order.forEach((oldIdx, newPos) => oldToNew.set(oldIdx, newPos));
+
+        // přemapuj správné indexy
+        const newCi = (q.ci ?? [])
+            .map((old) => oldToNew.get(old))
+            .filter((v): v is number => typeof v === 'number');
+
+        // u MSQ odstraň případné duplicity (pro jistotu)
+        const dedupCi = Array.from(new Set(newCi));
+
+        return { ...q, o: shuffledChoices, ci: dedupCi };
+    }
+
 }

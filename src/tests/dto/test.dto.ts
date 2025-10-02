@@ -10,7 +10,15 @@ import {
     OrderQuestionDto,
 } from './question.dto';
 
-@ApiExtraModels(McqQuestionDto, MsqQuestionDto, TfQuestionDto, ShortQuestionDto, ClozeQuestionDto, MatchQuestionDto, OrderQuestionDto)
+@ApiExtraModels(
+    McqQuestionDto,
+    MsqQuestionDto,
+    TfQuestionDto,
+    ShortQuestionDto,
+    ClozeQuestionDto,
+    MatchQuestionDto,
+    OrderQuestionDto,
+)
 export class TestDto {
     @ApiProperty({ example: '68be049c0c1e702cee4cb5da' })
     _id!: string;
@@ -20,6 +28,23 @@ export class TestDto {
 
     @ApiProperty({ example: '68b14bbfa5b2e51ef9b2d07e' })
     uploaderId!: string;
+
+    // ⬇️ Doplněno: název testu
+    @ApiProperty({ example: 'Základy neuronových sítí' })
+    title!: string;
+
+    // ⬇️ Doplněno: délka testu v minutách
+    @ApiProperty({ example: 90, description: 'Délka testu v minutách' })
+    duration!: number;
+
+    // ⬇️ Doplněno: mix typů otázek (Record<string, number>)
+    @ApiProperty({
+        description: 'Počet otázek podle typu',
+        example: { mcq: 26, tf: 1, msq: 2, cloze: 0 },
+        type: 'object',
+        additionalProperties: { type: 'number' },
+    })
+    mix!: Record<string, number>;
 
     @ApiProperty({
         type: 'array',

@@ -63,6 +63,9 @@ QuestionSchema.path('type').validate(function () {
 export class Test {
     @Prop({ required: true }) folderId: string;
     @Prop({ required: true }) uploaderId: string;
+    @Prop({ required: true }) title: string;
+    @Prop({ required: true }) duration: number;
+    @Prop({ required: true, type: Object }) mix: Record<string, number>;
 
     @Prop({ type: [QuestionSchema], default: [] })
     questions: DbQuestion[];
@@ -88,3 +91,5 @@ TestSchema.set('toJSON', {
         return ret;
     },
 });
+
+TestSchema.index({ folderId: 1, uploaderId: 1, archived: 1, createdAt: 1 });

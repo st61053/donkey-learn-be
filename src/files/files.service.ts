@@ -119,7 +119,24 @@ export class FilesService {
         const doc = await this.fileModel.findById(documentId).lean();
         if (!doc) throw new NotFoundException('File not found');
         this.ensureOwnerOrAdmin(doc.uploaderId, user);
-        return this.chunkModel.find({ documentId }).sort({ index: 1 }).lean();
+
+        const rows = await this.chunkModel
+            .find({ documentId })
+            .sort({ index: 1 })
+            .lean();
+
+        return rows.map((r: any) => ({
+            id: r._id?.toString?.() ?? r._id,
+            documentId: r.documentId,
+            index: r.index,
+            text: r.text,
+            startOffset: r.startOffset,
+            endOffset: r.endOffset,
+            pageFrom: r.pageFrom ?? null,
+            pageTo: r.pageTo ?? null,
+            createdAt: r.createdAt?.toISOString?.() ?? r.createdAt,
+            updatedAt: r.updatedAt?.toISOString?.() ?? r.updatedAt,
+        }));
     }
 
     async parseAndChunkForUser(documentId: string, user: UserCtx, size = 1000, overlap = 150) {

@@ -1,8 +1,8 @@
-// src/ai/ai.service.ts
 import { Injectable, Logger } from '@nestjs/common';
 import { AiRequestDto } from './dto/ai-request.dto';
 import { AiResponseDto, AiQuestion } from './dto/ai-response.dto';
 import OpenAI from 'openai';
+import { normalizeAiQuestions } from './normalize-ai';
 
 type LocalReasoningEffort = 'low' | 'medium' | 'high';
 type LocalReasoning = { effort?: LocalReasoningEffort };
@@ -44,19 +44,52 @@ export class AiService {
         });
 
         const systemMsg =
-            'Jsi přísný zkoušející. Tvoř otázky výhradně z poskytnutých úryvků (c:id f:fileId | text). Nehalucinuj.';
+            `Jsi přísný zkoušející. Tvoř otázky VÝHRADNĚ z poskytnutých úryvků, ale v otázce se neodkazuj na úryvek nebo text; mimozdrojové znalosti nepoužívej. ` +
+            `Nehalucinuj. Výstup musí být přesný, konzistentní a v češtině.`;
 
         const headerOnly = [
-            instruction || 'Vytvoř smysluplné, fakticky přesné otázky.',
-            `Mix (horní limity, můžeš vytvořit méně): ${JSON.stringify(mix ?? {})}`,
-            `GENERUJ POUZE tyto typy: ${allowedKinds.join(', ')}. Jiné typy NEVRACEJ.`,
-            'U každé otázky vyplň s.c = ID úryvku (po "c:" v řádku) a s.f = fileId (po "f:" v řádku).',
-            `Maximálně ${boundedTarget} otázek. Použij různé typy dle mixu.`,
-            `Preferuj koncepty, které se v úryvcích explicitně definují/vysvětlují; ignoruj boilerplate a metadata.`,
-            `NEVKLÁDEJ do textu otázek ani možností identifikátory zdrojů (např. "c:...", "f:..."), názvy souborů, ani fráze typu "Podle úryvku", "Dle textu", "Viz úryvek".`,
-            `Identifikátory zdrojů zapisuj POUZE do objektu s: { s: { c: <chunkId>, f: <fileId> } }.`,
-            `Formuluj otázku soběstačně (bez "Podle úryvku …").`,
-            `Úryvky následují po této hlavičce.`,
+            // 1) Základní instrukce
+            (instruction || 'Vytvoř smysluplné, fakticky přesné a samostatně srozumitelné otázky.'),
+
+            // 2) Tvary a limity
+            `Mix (horní limity; můžeš vytvořit méně, ale nikdy více): ${JSON.stringify(mix ?? {})}`,
+            `GENERUJ POUZE tyto typy: ${allowedKinds.join(', ')} (jiné typy ANI NEZMIŇUJ).`,
+            `Maximálně ${boundedTarget} otázek.`,
+
+            // 3) Tvrdé zásady proti “podle textu”
+            `Otázky MUSÍ být samostatné – nesmí obsahovat žádný odkaz na zdroj/úryvek/odstavec/“v textu”, ` +
+            `např. „podle úryvku“, „v textu se uvádí“, „viz výše“, „v pasáži“.`,
+            `NEVKLÁDEJ do textu otázky ani možností identifikátory zdrojů (např. "c:...", "f:...", názvy souborů).`,
+            `Identifikátory zdrojů zapisuj POUZE do objektu "s": { "c": <chunkId>, "f": <fileId> }.`,
+            `Formuluj otázku soběstačně (bez „Podle úryvku…“, „V textu…“, „Z pasáže…“).`,
+
+            // 4) Vedení kvality
+            `Preferuj pojmy, definice a fakta, která jsou v úryvcích explicitně uvedená. Ignoruj boilerplate a metadata.`,
+            `Buď konkrétní; vyhni se vágním formulacím („které tvrzení NEJSPÍŠ platí…“).`,
+
+            // 5) Specifické pokyny pro typy
+            `MCQ: přesně 1 správná odpověď (pole "ci" obsahuje 1 index). Distraktory věrohodné, ne „vše výše uvedené“.`,
+            `MSQ: 2–4 správné odpovědi (pole "ci" obsahuje ≥2 indexy).`,
+            `TF: "r" je boolean (true/false), formulace výroku přesná.`,
+            `SHORT: jedna stručná správná odpověď v "r".`,
+            `CLOZE: "t" s vynechávkami "____"; správná slova v poli "g".`,
+            `MATCH: páry v polích "l" a "r" (stejná délka, min. 3).`,
+            `ORDER: seřaditelné položky v "o" (min. 4).`,
+
+            // 6) Styl a délka
+            `Jazyk: čeština. Bez markdownu. Bez vysvětlování postupu.`,
+            `Délky orientačně: otázka ≤ 200 znaků; položka možností ≤ 120 znaků.`,
+
+            // 7) Validace před odevzdáním
+            `Každá otázka MUSÍ mít "s.c" (chunkId z řádku "c:…") a "s.f" (fileId z řádku "f:…").`,
+            `V případě pochybností raději zmenši počet otázek než porušit pravidla.`,
+
+            // 8) Negativní/pozitivní příklady (anti-pattern → správně)
+            `ŠPATNĚ (odkaz na zdroj): "Která z následujících verzí UNIXu byla uvedena v textu…?"`,
+            `SPRÁVNĚ (soběstačně): "Která z následujících verzí UNIXu je implementací od komerční společnosti?"`,
+
+            // 9) Co následuje
+            `Úryvky (řádky) následují po této hlavičce ve formátu: "c:<chunkId> f:<fileId> | <text>".`,
         ].join('\n');
 
         const desiredMaxOut = Number(process.env.OPENAI_MAX_OUTPUT_TOKENS ?? 800);
@@ -83,8 +116,9 @@ export class AiService {
         const userMsg = [
             'VRAŤ POUZE JSON podle přiloženého schématu. Žádný volný text.',
             'Začni přesně {"qs":[ a dokonči platný JSON s uzavíracími ]}.',
-            'Vyplň VŠECHNA níže uvedená pole u každé otázky. Pro typy, kde pole nedává smysl, použij neutrální hodnoty: ' +
-            'o, ci, l, rm, g = []; rb = false; rs = ""; s = {}.',
+            `SHORT: „odpověď dej do r (string), nesmí být prázdná; nepoužívej rs`,
+            `TF: r je boolean`,
+            `MCQ/MSQ: povinné o a ci`,
             headerOnly,
             'Úryvky:',
             cap.cappedLines.join('\n'),
@@ -156,7 +190,8 @@ export class AiService {
             // ✅ Structured Outputs / text → vytěž qs
             const qsRaw = this.extractQsFromResponses(resp);
             if (qsRaw?.length) {
-                const valid = this.validateQuestions(qsRaw);
+                const normalized = normalizeAiQuestions(qsRaw);
+                const valid = this.validateQuestions(normalized);
                 const filtered = this.filterAndCapByMix(valid, mix);
                 if (filtered.length > 0) {
                     this.logger.log(`Generated ${filtered.length} questions (responses)`);
@@ -239,7 +274,8 @@ export class AiService {
             const raw = resp3.choices?.[0]?.message?.content ?? '';
             if (!raw) this.dumpAiRaw(resp3, raw, 'chat-json-only-empty');
             const parsed3 = this.safeParseQuestions(raw);
-            const valid3 = this.filterAndCapByMix(parsed3);
+            const normalized3 = normalizeAiQuestions(parsed3);
+            const valid3 = this.filterAndCapByMix(normalized3);
             if (valid3.length > 0) {
                 this.dumpQuestionsToFile(valid3, model, 'chat-json-only');
                 return valid3;
@@ -311,7 +347,8 @@ export class AiService {
 
         this.logAiShape(resp, 'tools');
         const parsed = this.extractFromToolOrContent(resp);
-        const valid = this.filterAndCapByMix(parsed);
+        const normalized = normalizeAiQuestions(parsed);
+        const valid = this.filterAndCapByMix(normalized);
         if (valid.length > 0) {
             this.dumpQuestionsToFile(valid, model, 'chat-tools');
             return valid;

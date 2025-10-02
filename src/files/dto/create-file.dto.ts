@@ -1,15 +1,13 @@
-// src/files/dto/create-file.dto.ts
 import { IsOptional, IsArray, IsMongoId } from 'class-validator';
-import { ApiPropertyOptional } from '@nestjs/swagger';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
 export class CreateFileDto {
-    @ApiPropertyOptional({ type: [String] })
+    @ApiPropertyOptional({ type: [String], example: ['invoice', '2025', 'finance'] })
     @IsArray()
     @IsOptional()
     tags?: string[];
 
-    @ApiPropertyOptional({ type: String, description: 'Target folder id' })
+    @ApiProperty({ description: 'Target folder id', example: '66cf19ee2e3a4b5c6d7e8f8f' })
     @IsMongoId()
-    @IsOptional()
-    folderId: string;
+    folderId!: string;
 }
